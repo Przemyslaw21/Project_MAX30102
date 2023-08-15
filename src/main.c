@@ -14,235 +14,440 @@
 #include <zephyr/drivers/gpio.h>
 #include <soc.h>
 
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/hci.h>
-#include <zephyr/bluetooth/conn.h>
-#include <zephyr/bluetooth/uuid.h>
-#include <zephyr/bluetooth/gatt.h>
+// Things what i add
+#include <stdio.h>
+#include <math.h>
+#include <max30102.h>
+#include "algorithm.c"
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/timer/system_timer.h>
 
-#include <bluetooth/services/lbs.h>
-
-#include <zephyr/settings/settings.h>
-
-#include <dk_buttons_and_leds.h>
-
-#define DEVICE_NAME             CONFIG_BT_DEVICE_NAME
-#define DEVICE_NAME_LEN         (sizeof(DEVICE_NAME) - 1)
-
-
-#define RUN_STATUS_LED          DK_LED1
-#define CON_STATUS_LED          DK_LED2
-#define RUN_LED_BLINK_INTERVAL  1000
-
-#define USER_LED                DK_LED3
-
-#define USER_BUTTON             DK_BTN1_MSK
-
-static bool app_button_state;
-
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
-};
-
-static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
-};
-
-static void connected(struct bt_conn *conn, uint8_t err)
+typedef enum MAX30102_STATUS
 {
-	if (err) {
-		printk("Connection failed (err %u)\n", err);
-		return;
+	MAX30102_OK = 0,
+	MAX30102_ERROR = 1
+} MAX30102_STATUS;
+
+typedef struct
+{
+	uint8_t IRQ_Status_Flags[1];
+	uint8_t Temp_Reg;
+	uint32_t Raw_HR_Data;
+	bool Shootdown_STATUS;
+	uint32_t Raw_Data_Red_LED;
+	uint32_t Raw_Data_IR_LED;
+	float Data_Temp;
+
+} MAX30102_Data;
+
+MAX30102_Data Data_HR;
+
+#define I2C_NODE DT_NODELABEL(i2c0)
+static const struct device *i2c0_dev = DEVICE_DT_GET(I2C_NODE);
+
+MAX30102_STATUS MAX30102_Init(const struct device *i2c0_dev);
+MAX30102_STATUS MAX30102_Read_Reg(const struct device *i2c0_dev, uint8_t reg_addr, uint8_t Tmp);
+MAX30102_STATUS MAX30102_Write_Reg(const struct device *i2c0_dev, uint8_t Reg_Addr, uint8_t value);
+MAX30102_STATUS MAX30102_Write_Reg_Bit(const struct device *i2c0_dev, uint8_t Register, uint8_t Bit, uint8_t Value);
+
+MAX30102_STATUS MAX30102_Reset(const struct device *i2c0_dev);
+MAX30102_STATUS MAX30102_Read_and_Clear_IRQ_FLAG(const struct device *i2c0_dev);
+MAX30102_STATUS MAX30102_Set_Mode(uint8_t Mode);
+MAX30102_STATUS MAX30102_Sleep_Mode(uint8_t Enable);
+
+MAX30102_STATUS MAX30102_Read_Fifo(MAX30102_Data *data);
+MAX30102_STATUS MAX30102_Fifo_Write_Pointer(uint16_t Value_to_write);
+MAX30102_STATUS MAX30102_Fifo_Overflow_Counter(uint16_t Value_to_write);
+MAX30102_STATUS MAX30102_Fifo_Read_Pointer(uint16_t Value_to_write);
+MAX30102_STATUS MAX30102_Fifo_Sample_Averaging(uint16_t Value_to_write);
+MAX30102_STATUS MAX30102_Fifo_Rollover_Enable(uint8_t Flag_to_write);
+MAX30102_STATUS MAX30102_Fifo_Almost_Full_Value(uint8_t Value);
+
+// SpO2
+MAX30102_STATUS MAX30102_Adc_Range(uint8_t Value);
+MAX30102_STATUS MAX30102_Sample_Rate(uint8_t Value);
+
+// LED
+MAX30102_STATUS MAX30102_LED_Pulse_Width(uint8_t Value);
+MAX30102_STATUS MAX30102_LED_1_Pulse_Amplitude(uint16_t Value);
+MAX30102_STATUS MAX30102_LED_2_Pulse_Amplitude(uint16_t Value);
+
+// Temperature
+MAX30102_STATUS MAX30102_Get_Temp(MAX30102_Data *data);
+//_________________________
+
+// Work_Callback
+static void MAX30102_Work_Cb(struct k_work *work)
+{
+	MAX30102_Sleep_Mode(0);
+	MAX30102_Init(i2c0_dev);
+	MAX30102_Read_Fifo(&Data_HR);
+	printk("Data RED LED: %u  IR LED: %u  TEMP: %.2f \n", Data_HR.Raw_Data_Red_LED, Data_HR.Raw_Data_IR_LED, Data_HR.Data_Temp);
+	MAX30102_Sleep_Mode(1);
+}
+
+struct k_work MAX30102_Work;
+
+// Timers
+static void Timer0_CallBack(struct k_timer *dummy)
+{
+	k_work_submit(&MAX30102_Work);
+};
+
+struct k_timer timer0;
+
+void main(void)
+{
+
+	k_work_init(&MAX30102_Work, MAX30102_Work_Cb);
+	k_timer_init(&timer0, Timer0_CallBack, NULL); // NULL = stop function
+	k_timer_start(&timer0, K_SECONDS(1), K_SECONDS(1));
+
+	if (!device_is_ready(i2c0_dev))
+
+	{
+		printk("DEVICE IS NOT READY");
 	}
 
-	printk("Connected\n");
+	MAX30102_Init(i2c0_dev);
 
-	dk_set_led_on(CON_STATUS_LED);
+	while (1)
+	{
+		// k_msleep(SYS_TIME_SLEEP_MS);
+		// MAX30102_Read_Fifo(&Data_HR);
+		// MAX30102_Get_Temp(&Data_HR);
+	}
+
+	// maxim_heart_rate_and_oxygen_saturation(Data_HR.Raw_Data_IR_LED, Data_HR.Raw_Data_Red_LED);
 }
 
-static void disconnected(struct bt_conn *conn, uint8_t reason)
+MAX30102_STATUS MAX30102_Who_Im(const struct device *i2c0_dev)
 {
-	printk("Disconnected (reason %u)\n", reason);
+	uint8_t RegToRead[1] = {0};
+	if (0 != i2c_burst_read(i2c0_dev, MAX30102_ADDRESS, MAX30102_PARTID, RegToRead, 1))
+	{
+		printk("MAX30102 connected! Part ID: 0x%x\n", RegToRead[0]);
+		return MAX30102_OK;
+	}
+	else
+	{
+		printk("MAX30102 disconnected!");
 
-	dk_set_led_off(CON_STATUS_LED);
-}
+		if (RegToRead[0] != 0x15)
+			printk("MAX30102 wrong ID! Part ID: %dd\n", RegToRead[0]);
 
-#ifdef CONFIG_BT_LBS_SECURITY_ENABLED
-static void security_changed(struct bt_conn *conn, bt_security_t level,
-			     enum bt_security_err err)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	if (!err) {
-		printk("Security changed: %s level %u\n", addr, level);
-	} else {
-		printk("Security failed: %s level %u err %d\n", addr, level,
-			err);
+		return MAX30102_ERROR;
 	}
 }
+MAX30102_STATUS MAX30102_Init(const struct device *i2c0_dev) // Who Im?
+{
+
+#if RESET_DURING_INIT
+	if (MAX30102_OK != MAX30102_Reset(i2c0_dev)) // resets the MAX30102
+		return MAX30102_ERROR;
 #endif
 
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected        = connected,
-	.disconnected     = disconnected,
-#ifdef CONFIG_BT_LBS_SECURITY_ENABLED
-	.security_changed = security_changed,
-#endif
-};
+	// FIFO config
+	if (MAX30102_OK != MAX30102_Fifo_Write_Pointer(0x00)) // PoR 0X00 default
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Fifo_Overflow_Counter(0x00))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Fifo_Read_Pointer(0x00))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Fifo_Sample_Averaging(FIFO_SMP_AVE_1))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Fifo_Rollover_Enable(1))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Fifo_Almost_Full_Value(MAX30102_FIFO_ALMOST_FULL_SAMPLES))
+		return MAX30102_ERROR;
 
-#if defined(CONFIG_BT_LBS_SECURITY_ENABLED)
-static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
+	// Mode config
+	if (MAX30102_OK != MAX30102_Set_Mode(MODE_SpO2))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Adc_Range(SPO2_ADC_RGE_4096))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_Sample_Rate(MAX30102_SAMPLES_PER_SECOND))
+		return MAX30102_ERROR;
 
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	// LED Config
+	if (MAX30102_OK != MAX30102_LED_Pulse_Width(PULSE_WIDTH_69))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_LED_1_Pulse_Amplitude(IR_LED_CURRENT_HIGH))
+		return MAX30102_ERROR;
+	if (MAX30102_OK != MAX30102_LED_2_Pulse_Amplitude(RED_LED_CURRENT_HIGH))
+		return MAX30102_ERROR;
 
-	printk("Passkey for %s: %06u\n", addr, passkey);
+	// Temp config
+	// if (MAX30102_OK != MAX30102_Sample_Rate(MAX30102_SAMPLES_PER_SECOND))
+	// 	return MAX30102_ERROR;
+	// if (MAX30102_OK != MAX30102_Sample_Rate(MAX30102_SAMPLES_PER_SECOND))
+	// 	return MAX30102_ERROR;
+
+	// IRQ config
+	//  if (MAX30102_OK != MAX30102_Set_IRQ_Almost_Full_Enabled(1))
+	//  	return MAX30102_ERROR;
+	//  if (MAX30102_OK != MAX30102_Set_IRQ_Fifo_Data_Ready_Enabled(1))
+	//  return MAX30102_ERROR;
+
+	return MAX30102_OK;
 }
-
-static void auth_cancel(struct bt_conn *conn)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing cancelled: %s\n", addr);
-}
-
-static void pairing_complete(struct bt_conn *conn, bool bonded)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing completed: %s, bonded: %d\n", addr, bonded);
-}
-
-static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing failed conn: %s, reason %d\n", addr, reason);
-}
-
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-	.passkey_display = auth_passkey_display,
-	.cancel = auth_cancel,
-};
-
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
-	.pairing_complete = pairing_complete,
-	.pairing_failed = pairing_failed
-};
-#else
-static struct bt_conn_auth_cb conn_auth_callbacks;
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
-#endif
-
-static void app_led_cb(bool led_state)
-{
-	dk_set_led(USER_LED, led_state);
-}
-
-static bool app_button_cb(void)
-{
-	return app_button_state;
-}
-
-static struct bt_lbs_cb lbs_callbacs = {
-	.led_cb    = app_led_cb,
-	.button_cb = app_button_cb,
-};
-
-static void button_changed(uint32_t button_state, uint32_t has_changed)
-{
-	if (has_changed & USER_BUTTON) {
-		uint32_t user_button_state = button_state & USER_BUTTON;
-
-		bt_lbs_send_button_state(user_button_state);
-		app_button_state = user_button_state ? true : false;
-	}
-}
-
-static int init_button(void)
+MAX30102_STATUS MAX30102_Read_Reg(const struct device *i2c0_dev, uint8_t reg_addr, uint8_t Tmp)
 {
 	int err;
+	// uint8_t buf[1] = {0x00};
 
-	err = dk_buttons_init(button_changed);
-	if (err) {
-		printk("Cannot init buttons (err: %d)\n", err);
+	err = i2c_burst_read(i2c0_dev, MAX30102_ADDRESS, reg_addr, &Tmp, 1);
+	if (err)
+	{
+		printk("MAX30102: Error!\n");
+		return MAX30102_ERROR;
 	}
-
-	return err;
+	else
+	{
+		// Tmp = buf[0];
+		return MAX30102_OK;
+	}
 }
-
-int main(void)
+MAX30102_STATUS MAX30102_Write_Reg(const struct device *i2c0_dev, uint8_t Reg_Addr, uint8_t value)
 {
-	int blink_status = 0;
-	int err;
-
-	printk("Starting Bluetooth Peripheral LBS example\n");
-
-	err = dk_leds_init();
-	if (err) {
-		printk("LEDs init failed (err %d)\n", err);
-		return 0;
+	int err = i2c_burst_write(i2c0_dev, MAX30102_ADDRESS, Reg_Addr, &value, 1);
+	if (err)
+	{
+		printk("MAX30102: Error!\n");
+		return MAX30102_ERROR;
 	}
-
-	err = init_button();
-	if (err) {
-		printk("Button init failed (err %d)\n", err);
-		return 0;
-	}
-
-	if (IS_ENABLED(CONFIG_BT_LBS_SECURITY_ENABLED)) {
-		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-		if (err) {
-			printk("Failed to register authorization callbacks.\n");
-			return 0;
-		}
-
-		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-		if (err) {
-			printk("Failed to register authorization info callbacks.\n");
-			return 0;
-		}
-	}
-
-	err = bt_enable(NULL);
-	if (err) {
-		printk("Bluetooth init failed (err %d)\n", err);
-		return 0;
-	}
-
-	printk("Bluetooth initialized\n");
-
-	if (IS_ENABLED(CONFIG_SETTINGS)) {
-		settings_load();
-	}
-
-	err = bt_lbs_init(&lbs_callbacs);
-	if (err) {
-		printk("Failed to init LBS (err:%d)\n", err);
-		return 0;
-	}
-
-	err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));
-	if (err) {
-		printk("Advertising failed to start (err %d)\n", err);
-		return 0;
-	}
-
-	printk("Advertising successfully started\n");
-
-	for (;;) {
-		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);
-		k_sleep(K_MSEC(RUN_LED_BLINK_INTERVAL));
+	else
+	{
+		return MAX30102_OK;
 	}
 }
+MAX30102_STATUS MAX30102_Write_Reg_Bit(const struct device *i2c0_dev, uint8_t Register, uint8_t Bit, uint8_t Value)
+{
+	uint8_t Tmp;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, Register, &Tmp))
+		return MAX30102_ERROR;
+	Tmp &= ~(1 << Bit);
+	Tmp |= (Value & 0x01) << Bit;
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, Register, Tmp))
+		return MAX30102_ERROR;
+
+	return MAX30102_OK;
+}
+
+MAX30102_STATUS MAX30102_Reset(const struct device *i2c0_dev) // Reset MAX30102
+{
+	uint8_t RegToWrite[1] = {MAX30102_RESET};
+	uint8_t err = i2c_reg_write_byte(i2c0_dev, MAX30102_ADDRESS, MAX30102_MODE_CONFIG, RegToWrite[0]);
+
+	if (err)
+	{
+		printk("Reset error!\n");
+		return MAX30102_ERROR;
+	}
+	else
+	{
+		printk("Reset done!\n");
+		return MAX30102_OK;
+	}
+}
+MAX30102_STATUS MAX30102_Clear_IRQ_FLAG(const struct device *i2c0_dev, MAX30102_Data *data) // Reads the interrupt status registers, clearing is automaticly
+{
+	data->IRQ_Status_Flags[1] = 0x0;
+	int err = i2c_burst_read(i2c0_dev, MAX30102_ADDRESS, MAX30102_IRQ_STATUS_1, data->IRQ_Status_Flags, 1);
+
+	if (err)
+	{
+		printk("MAX30102: Interrupt Status 1: Error!\n");
+		return MAX30102_ERROR;
+	}
+	else
+	{
+		printk("MAX30102: Interrupt Status 1: Ok (%d)\n", data->IRQ_Status_Flags[0]);
+		return MAX30102_OK;
+	}
+}
+MAX30102_STATUS MAX30102_Set_Mode(uint8_t Mode)
+{
+	uint8_t Tmp;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, MAX30102_MODE_CONFIG, &Tmp))
+		return MAX30102_ERROR;
+	Tmp &= ~(0x07);
+	Tmp |= (Mode & 0x07);
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_MODE_CONFIG, Tmp))
+		return MAX30102_ERROR;
+
+	return MAX30102_OK;
+}
+MAX30102_STATUS MAX30102_Sleep_Mode(uint8_t Enable) // POWER SAVE MODE
+{
+	uint8_t Tmp;
+	;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, MAX30102_MODE_CONFIG, Tmp))
+		return MAX30102_ERROR;
+
+	if (Enable == 1)
+	{
+		Tmp |= 0x40;
+		if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_MODE_CONFIG, Tmp))
+			return MAX30102_ERROR;
+	}
+	else if (Enable == 0)
+	{
+		Tmp |= 0x40;
+		if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_MODE_CONFIG, Tmp))
+			return MAX30102_ERROR;
+	}
+
+	return MAX30102_OK;
+}
+
+// FIFO
+MAX30102_STATUS MAX30102_Read_Fifo(MAX30102_Data *data)
+{
+
+	uint32_t Tmp;
+	data->Raw_Data_Red_LED = 0;
+	data->Raw_Data_IR_LED = 0;
+	unsigned char Tmp_Buff_I2C[6];
+
+#if OMIT_FIFO // USE FOR OMIT FIFO AND GET GOING SAMPLES
+	if (MAX30102_OK != MAX30102_Fifo_Write_Pointer(0x00))
+		return MAX30102_ERROR;
+#endif
+
+	if (0 != i2c_burst_read(i2c0_dev, MAX30102_ADDRESS, MAX30102_REG_FIFO_DATA, Tmp_Buff_I2C, 6))
+	{
+		printk("MAX30102: Error!\n");
+		return MAX30102_ERROR;
+	}
+	Tmp = Tmp_Buff_I2C[0];
+	Tmp <<= 16;
+	data->Raw_Data_Red_LED += Tmp;
+	Tmp = Tmp_Buff_I2C[1];
+	Tmp <<= 8;
+	data->Raw_Data_Red_LED += Tmp;
+	Tmp = Tmp_Buff_I2C[2];
+	data->Raw_Data_Red_LED += Tmp;
+
+	Tmp = Tmp_Buff_I2C[3];
+	Tmp <<= 16;
+	data->Raw_Data_IR_LED += Tmp;
+	Tmp = Tmp_Buff_I2C[4];
+	Tmp <<= 8;
+	data->Raw_Data_IR_LED += Tmp;
+	Tmp = Tmp_Buff_I2C[5];
+	data->Raw_Data_IR_LED += Tmp;
+
+	data->Raw_Data_Red_LED &= 0x03FFFF;
+	data->Raw_Data_IR_LED &= 0x03FFFF;
+
+	return MAX30102_OK;
+}
+MAX30102_STATUS MAX30102_Fifo_Write_Pointer(uint16_t Value)
+{
+	return MAX30102_Write_Reg(i2c0_dev, MAX30102_FIFO_WRITE_PTR, (Value & 0x1F)); // FIFO_WR_PTR[4:0]
+}
+MAX30102_STATUS MAX30102_Fifo_Overflow_Counter(uint16_t Value)
+{
+	return MAX30102_Write_Reg(i2c0_dev, MAX30102_OVERFLOW_COUNT, (Value & 0x1F)); // FIFO_WR_PTR[4:0]
+}
+MAX30102_STATUS MAX30102_Fifo_Read_Pointer(uint16_t Value)
+{
+	return MAX30102_Write_Reg(i2c0_dev, MAX30102_FIFO_READ_PTR, (Value & 0x1F)); // FIFO_WR_PTR[4:0]
+};
+MAX30102_STATUS MAX30102_Fifo_Sample_Averaging(uint16_t Value)
+{
+	uint8_t Tmp;
+	MAX30102_Read_Reg(i2c0_dev, MAX30102_FIFO_CONFIG, &Tmp);
+
+	Tmp &= ~(0x07);
+	Tmp |= (Value & 0x07) << 5;
+	return MAX30102_Write_Reg(i2c0_dev, MAX30102_FIFO_CONFIG, &Tmp);
+}
+MAX30102_STATUS MAX30102_Fifo_Rollover_Enable(uint8_t Flag)
+{
+	// ON = 1
+	// OFF = 0
+	return MAX30102_Write_Reg_Bit(i2c0_dev, MAX30102_FIFO_CONFIG, FIFO_CONF_FIFO_ROLLOVER_EN_BIT, (Flag & 0x01));
+}
+MAX30102_STATUS MAX30102_Fifo_Almost_Full_Value(uint8_t Value)
+{
+	if (Value < 17)
+		Value = 17;
+	if (Value > 32)
+		Value = 32;
+	Value = 32 - Value;
+	uint8_t Tmp;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, MAX30102_FIFO_CONFIG, &Tmp))
+		return MAX30102_ERROR;
+	Tmp &= ~(0x0F);
+	Tmp |= (Value & 0x0F);
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_FIFO_CONFIG, Tmp))
+		return MAX30102_ERROR;
+
+	return MAX30102_OK;
+}
+
+MAX30102_STATUS MAX30102_Adc_Range(uint8_t Value)
+{
+	uint8_t tmp;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, MAX30102_SPO2_CONFIG, &tmp))
+		return MAX30102_ERROR;
+	tmp &= ~(0x03);
+	tmp |= ((Value & 0x03) << 5);
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_SPO2_CONFIG, Value))
+		return MAX30102_ERROR;
+
+	return MAX30102_OK;
+}
+MAX30102_STATUS MAX30102_Sample_Rate(uint8_t Value)
+{
+	uint8_t tmp;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, MAX30102_SPO2_CONFIG, &tmp))
+		return MAX30102_ERROR;
+	tmp &= ~(0x07);
+	tmp |= ((Value & 0x07) << 2);
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_SPO2_CONFIG, Value))
+		return MAX30102_ERROR;
+
+	return MAX30102_OK;
+}
+MAX30102_STATUS MAX30102_LED_Pulse_Width(uint8_t Value)
+{
+	uint8_t tmp;
+	if (MAX30102_OK != MAX30102_Read_Reg(i2c0_dev, MAX30102_SPO2_CONFIG, &tmp))
+		return MAX30102_ERROR;
+	tmp &= ~(0x03);
+	tmp |= (Value & 0x03);
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_SPO2_CONFIG, Value))
+		return MAX30102_ERROR;
+
+	return MAX30102_OK;
+}
+MAX30102_STATUS MAX30102_LED_1_Pulse_Amplitude(uint16_t Value) //	LED Current = Value * 0.2 mA
+{
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_LED1_PULSE_AMPLITUDE, Value))
+		return MAX30102_ERROR;
+	return MAX30102_OK;
+}
+MAX30102_STATUS MAX30102_LED_2_Pulse_Amplitude(uint16_t Value) //	LED Current = Value * 0.2 mA
+{
+	if (MAX30102_OK != MAX30102_Write_Reg(i2c0_dev, MAX30102_LED2_PULSE_AMPLITUDE, Value))
+		return MAX30102_ERROR;
+	return MAX30102_OK;
+}
+
+MAX30102_STATUS MAX30102_Get_Temp(MAX30102_Data *data) // nie czyta rejestru
+{
+	uint16_t Tmp_Integer;
+	uint16_t Tmp_Fraction;
+	// MAX30102_Temp_Init_Conversion();
+	MAX30102_Write_Reg_Bit(i2c0_dev, TEMP_ENABLE, 0, 1);
+	MAX30102_Read_Reg(i2c0_dev, TEMP_INTEGER, Tmp_Integer);
+	MAX30102_Read_Reg(i2c0_dev, TEMP_FRACTION, Tmp_Fraction);
+	Tmp_Fraction = Tmp_Fraction * TEMP_FRACTION_STEP;
+	data->Data_Temp = (Tmp_Integer + Tmp_Fraction);
+	return MAX30102_OK;
+}
+
+// Timer

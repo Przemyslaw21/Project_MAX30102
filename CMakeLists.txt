@@ -15,3 +15,5 @@ target_sources(app PRIVATE
 
 # NORDIC SDK APP END
 zephyr_library_include_directories(.)
+zephyr_include_directories(src/max30102)
+ 
